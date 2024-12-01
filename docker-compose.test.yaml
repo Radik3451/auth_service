@@ -1,0 +1,24 @@
+networks:
+  my_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.101.0/24
+
+volumes:
+  test_db_data:
+
+services:
+  postgres:
+    image: postgres:latest
+    container_name: test_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: app_db
+    ports:
+      - "5432:5432"
+    networks:
+      - my_network
+    volumes:
+      - test_db_data:/var/lib/postgresql/data

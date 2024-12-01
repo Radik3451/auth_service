@@ -1,0 +1,19 @@
+env: "local" #local, dev, prod
+jwt_secret: "secret"
+
+database:
+  host: "my_postgres" #localhost для make run
+  port: 5432
+  user: "postgres"
+  password: "password"
+  dbname: "app_db"
+  max_open_connections: 50
+  max_idle_connections: 10
+  connection_max_lifetime: 30m
+
+http_server:
+  address: "localhost:8080"
+  timeout: 4s
+  idle_timeout: 60s       
+  read_header_timeout: 2s   
+  write_timeout: 8s       
