@@ -1,4 +1,3 @@
-```markdown
 # Auth Service
 
 ## Команды Makefile
