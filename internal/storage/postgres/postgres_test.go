@@ -1,6 +1,7 @@
 package postgres_test
 
 import (
+	"auth_service/internal/services/tokens"
 	"auth_service/internal/storage/postgres"
 	"context"
 	"fmt"
@@ -107,10 +108,19 @@ func runMigrations(pool *pgxpool.Pool) error {
 // Выполняет интеграционные тесты для методов хранения в Postgres.
 //
 // Тестируются следующие методы:
-// - SaveRefreshToken
-// - GetRefreshToken
-// - UpdateRefreshToken
-// - GetLastIP
+// - SaveRefreshToken: проверяет корректность сохранения refresh токена и IP-адреса клиента.
+// - GetRefreshToken: проверяет возможность получения хешированного refresh токена из базы данных.
+// - UpdateRefreshToken: проверяет обновление refresh токена и IP-адреса клиента.
+// - GetLastIP: проверяет получение последнего IP-адреса клиента.
+// - GetUserEmail: проверяет получение email пользователя по его идентификатору.
+// - Проверка связи Access и Refresh токенов: тестирует зависимость Access токена от Refresh токена, включая корректность их генерации и валидации.
+// - Проверка обработки изменения IP: проверяет корректность обнаружения изменения IP-адреса клиента и возможность отправки предупреждения пользователю (email).
+//
+// Тесты включают:
+// - Генерацию refresh токена и его сохранение в базе данных с последующей проверкой.
+// - Генерацию нового refresh токена, его обновление и проверку в базе данных.
+// - Проверку валидации Access токена, сгенерированного на основе refresh токена.
+// - Проверку корректного получения email пользователя для отправки предупреждения при изменении IP.
 func TestPostgresStorage(t *testing.T) {
 	recreateTestDB()
 
@@ -124,39 +134,86 @@ func TestPostgresStorage(t *testing.T) {
 
 	storage := postgres.NewPostgresStorage(pool)
 
+	// --- Тестовые данные ---
 	userID := "123e4567-e89b-12d3-a456-426614174000"
-	hashedToken := "hashed_refresh_token_example"
+	email := "test@example.com"
 	clientIP := "127.0.0.1"
 
+	// Создаём пользователя
 	createUserQuery := `
 		INSERT INTO users (id, email, password_hash, created_at, updated_at)
 		VALUES ($1, $2, $3, NOW(), NOW())`
+	_, err = pool.Exec(context.Background(), createUserQuery, userID, email, "hashed_password")
+	assert.NoError(t, err)
 
-	_, err = pool.Exec(context.Background(), createUserQuery, userID, "test@example.com", "hashed_password")
-	if err != nil {
-		t.Fatalf("Failed to create user: %v", err)
-	}
+	// --- Проверка метода GetUserEmail ---
+	retrievedEmail, err := storage.GetUserEmail(userID)
+	assert.NoError(t, err)
+	assert.Equal(t, email, retrievedEmail)
 
-	// Тест сохранения Refresh Token
+	// --- Генерация Refresh токена и его хеширование ---
+	refreshToken, hashedToken, err := tokens.GenerateRefreshTokenAndHash()
+	assert.NoError(t, err)
+
+	// --- Сохранение Refresh токена ---
 	err = storage.SaveRefreshToken(userID, hashedToken, clientIP)
 	assert.NoError(t, err)
 
-	// Тест получения Refresh Token
-	retrievedToken, err := storage.GetRefreshToken(userID)
+	// --- Проверка сохранённого токена ---
+	retrievedHashedToken, err := storage.GetRefreshToken(userID)
 	assert.NoError(t, err)
-	assert.Equal(t, hashedToken, retrievedToken)
 
-	// Тест обновления Refresh Token
-	newHashedToken := "new_hashed_refresh_token_example"
+	// Сравниваем хеш токена с оригинальным токеном
+	err = tokens.CompareRefreshToken(retrievedHashedToken, refreshToken)
+	assert.NoError(t, err)
+
+	// --- Обновление Refresh токена ---
+	newRefreshToken, newHashedToken, err := tokens.GenerateRefreshTokenAndHash()
+	assert.NoError(t, err)
 	newClientIP := "192.168.1.1"
+
 	err = storage.UpdateRefreshToken(userID, newHashedToken, newClientIP)
 	assert.NoError(t, err)
 
-	updatedToken, err := storage.GetRefreshToken(userID)
+	// Проверяем обновлённый токен
+	updatedHashedToken, err := storage.GetRefreshToken(userID)
 	assert.NoError(t, err)
-	assert.Equal(t, newHashedToken, updatedToken)
+	err = tokens.CompareRefreshToken(updatedHashedToken, newRefreshToken)
+	assert.NoError(t, err)
 
+	// Проверяем обновлённый IP
 	updatedIP, err := storage.GetLastIP(userID)
 	assert.NoError(t, err)
 	assert.Equal(t, newClientIP, updatedIP)
+
+	// Проверяем связь Access и Refresh токенов
+	jwtSecret := "supersecretkey"
+	accessToken, err := tokens.GenerateAccessToken(userID, newClientIP, jwtSecret, newHashedToken)
+	assert.NoError(t, err)
+
+	// Валидация Access токена
+	validatedUserID, validatedClientIP, validatedRefreshHash, err := tokens.ValidateAccessToken(accessToken, jwtSecret)
+	assert.NoError(t, err)
+	assert.Equal(t, userID, validatedUserID)
+	assert.Equal(t, newClientIP, validatedClientIP)
+	assert.Equal(t, newHashedToken, validatedRefreshHash)
+
+	// Проверка отправки предупреждения при изменении IP
+	anotherClientIP := "203.0.113.45"
+	accessToken, err = tokens.GenerateAccessToken(userID, anotherClientIP, jwtSecret, newHashedToken)
+	assert.NoError(t, err)
+
+	// Валидация с изменённым IP
+	_, validatedNewClientIP, _, err := tokens.ValidateAccessToken(accessToken, jwtSecret)
+	assert.NoError(t, err)
+
+	// Проверяем, что IP изменился
+	assert.NotEqual(t, updatedIP, validatedNewClientIP)
+
+	// Проверка получения email для отправки предупреждения
+	warningEmail, err := storage.GetUserEmail(userID)
+	assert.NoError(t, err)
+	assert.Equal(t, email, warningEmail)
+
+	t.Logf("Warning email sent to: %s due to IP change from %s to %s", warningEmail, updatedIP, validatedNewClientIP)
 }

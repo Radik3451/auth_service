@@ -8,7 +8,6 @@ import (
 	"net/http"
 
 	"github.com/google/uuid"
-	"golang.org/x/crypto/bcrypt"
 )
 
 type TokenResponse struct {
@@ -22,6 +21,7 @@ type Storage interface {
 	GetRefreshToken(userID string) (string, error)
 	UpdateRefreshToken(userID, hashedToken, clientIP string) error
 	GetLastIP(userID string) (string, error)
+	GetUserEmail(userID string) (string, error)
 }
 
 // Обрабатывает запросы на генерацию новых токенов.
@@ -56,31 +56,26 @@ func GenerateTokensHandler(w http.ResponseWriter, r *http.Request, log *slog.Log
 	clientIP := r.RemoteAddr
 	log.Info("Client IP address obtained", slog.String("clientIP", clientIP))
 
-	accessToken, err := tokens.GenerateAccessToken(userID, clientIP, cfg.JWTSecret)
-	if err != nil {
-		log.Error("Failed to generate access token", slog.String("error", err.Error()))
-		http.Error(w, "failed to generate access token", http.StatusInternalServerError)
-		return
-	}
-
-	refreshToken, err := tokens.GenerateRefreshToken()
+	// Генерация Refresh токена и его хеша
+	refreshToken, hashedToken, err := tokens.GenerateRefreshTokenAndHash()
 	if err != nil {
 		log.Error("Failed to generate refresh token", slog.String("error", err.Error()))
 		http.Error(w, "failed to generate refresh token", http.StatusInternalServerError)
 		return
 	}
 
-	hashedToken, err := bcrypt.GenerateFromPassword([]byte(refreshToken), bcrypt.DefaultCost)
-	if err != nil {
-		log.Error("Failed to hash refresh token", slog.String("error", err.Error()))
-		http.Error(w, "failed to hash refresh token", http.StatusInternalServerError)
-		return
-	}
-
-	err = db.SaveRefreshToken(userID, string(hashedToken), clientIP)
+	// Сохранение Refresh токена
+	err = db.SaveRefreshToken(userID, hashedToken, clientIP)
 	if err != nil {
 		log.Error("Failed to save refresh token to database", slog.String("error", err.Error()))
 		http.Error(w, "failed to save refresh token", http.StatusInternalServerError)
+		return
+	}
+
+	accessToken, err := tokens.GenerateAccessToken(userID, clientIP, cfg.JWTSecret, hashedToken)
+	if err != nil {
+		log.Error("Failed to generate access token", slog.String("error", err.Error()))
+		http.Error(w, "failed to generate access token", http.StatusInternalServerError)
 		return
 	}
 
@@ -121,14 +116,12 @@ func RefreshTokensHandler(w http.ResponseWriter, r *http.Request, log *slog.Logg
 		return
 	}
 
-	userID, clientIP, err := tokens.ValidateAccessToken(req.AccessToken, cfg.JWTSecret)
+	userID, clientIP, storedHash, err := tokens.ValidateAccessToken(req.AccessToken, cfg.JWTSecret)
 	if err != nil {
 		log.Warn("Invalid access token provided", slog.String("error", err.Error()))
 		http.Error(w, "invalid access token", http.StatusUnauthorized)
 		return
 	}
-
-	log.Info("Access token validated", slog.String("user_id", userID), slog.String("clientIP", clientIP))
 
 	storedToken, err := db.GetRefreshToken(userID)
 	if err != nil {
@@ -137,7 +130,7 @@ func RefreshTokensHandler(w http.ResponseWriter, r *http.Request, log *slog.Logg
 		return
 	}
 
-	err = bcrypt.CompareHashAndPassword([]byte(storedToken), []byte(req.RefreshToken))
+	err = tokens.CompareRefreshToken(storedToken, req.RefreshToken)
 	if err != nil {
 		log.Warn("Invalid refresh token provided", slog.String("user_id", userID))
 		http.Error(w, "invalid refresh token", http.StatusUnauthorized)
@@ -153,37 +146,40 @@ func RefreshTokensHandler(w http.ResponseWriter, r *http.Request, log *slog.Logg
 
 	if clientIP != lastIP {
 		log.Warn("Client IP has changed", slog.String("user_id", userID), slog.String("lastIP", lastIP), slog.String("currentIP", clientIP))
+
+		email, err := db.GetUserEmail(userID)
+		if err != nil {
+			log.Error("Failed to retrieve user email", slog.String("error", err.Error()))
+			http.Error(w, "failed to retrieve user email", http.StatusInternalServerError)
+			return
+		}
+
+		log.Warn("Sending warning email", slog.String("email", email), slog.String("user_id", userID))
+		// Здесь можно добавить реальную интеграцию с почтовым сервисом.
 	}
 
-	newAccessToken, err := tokens.GenerateAccessToken(userID, clientIP, cfg.JWTSecret)
+	// Генерация новых токенов
+	newAccessToken, err := tokens.GenerateAccessToken(userID, clientIP, cfg.JWTSecret, storedHash)
 	if err != nil {
 		log.Error("Failed to generate access token", slog.String("error", err.Error()))
 		http.Error(w, "failed to generate access token", http.StatusInternalServerError)
 		return
 	}
 
-	newRefreshToken, err := tokens.GenerateRefreshToken()
+	newRefreshToken, newHashedToken, err := tokens.GenerateRefreshTokenAndHash()
 	if err != nil {
 		log.Error("Failed to generate refresh token", slog.String("error", err.Error()))
 		http.Error(w, "failed to generate refresh token", http.StatusInternalServerError)
 		return
 	}
 
-	newHashedToken, err := bcrypt.GenerateFromPassword([]byte(newRefreshToken), bcrypt.DefaultCost)
-	if err != nil {
-		log.Error("Failed to hash refresh token", slog.String("error", err.Error()))
-		http.Error(w, "failed to hash refresh token", http.StatusInternalServerError)
-		return
-	}
-
-	err = db.UpdateRefreshToken(userID, string(newHashedToken), clientIP)
+	// Обновление токена в базе
+	err = db.UpdateRefreshToken(userID, newHashedToken, clientIP)
 	if err != nil {
 		log.Error("Failed to update refresh token in database", slog.String("error", err.Error()))
 		http.Error(w, "failed to update refresh token", http.StatusInternalServerError)
 		return
 	}
-
-	log.Info("Tokens updated successfully", slog.String("user_id", userID), slog.Int("status", http.StatusOK))
 
 	response := TokenResponse{
 		AccessToken:  newAccessToken,

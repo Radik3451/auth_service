@@ -103,3 +103,21 @@ func (ps *PostgresStorage) GetLastIP(userID string) (string, error) {
 	}
 	return clientIP, nil
 }
+
+// Возвращает email пользователя из базы данных.
+//
+// Принимает:
+// - userID: идентификатор пользователя.
+//
+// Возвращает:
+// - строку (email пользователя).
+// - ошибку, если email не удалось получить.
+func (ps *PostgresStorage) GetUserEmail(userID string) (string, error) {
+	var email string
+	query := `SELECT email FROM users WHERE id = $1`
+	err := ps.pool.QueryRow(context.Background(), query, userID).Scan(&email)
+	if err != nil {
+		return "", fmt.Errorf("failed to get user email: %w", err)
+	}
+	return email, nil
+}

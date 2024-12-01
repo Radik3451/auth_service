@@ -14,13 +14,13 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"golang.org/x/crypto/bcrypt"
 )
 
 type MockStorage struct {
 	users         map[string]bool
 	refreshTokens map[string]string
 	ipAddresses   map[string]string
+	emails        map[string]string // Хранение email для каждого пользователя
 }
 
 func NewMockStorage() *MockStorage {
@@ -28,6 +28,7 @@ func NewMockStorage() *MockStorage {
 		users:         make(map[string]bool),
 		refreshTokens: make(map[string]string),
 		ipAddresses:   make(map[string]string),
+		emails:        make(map[string]string),
 	}
 }
 
@@ -99,6 +100,19 @@ func (m *MockStorage) GetLastIP(userID string) (string, error) {
 	return ip, nil
 }
 
+// Возвращает email пользователя.
+// Принимает userID (строка) — идентификатор пользователя.
+// Возвращает:
+// - строку (email пользователя).
+// - ошибку, если пользователь не существует.
+func (m *MockStorage) GetUserEmail(userID string) (string, error) {
+	email, exists := m.emails[userID]
+	if !exists {
+		return "", fmt.Errorf("user does not exist")
+	}
+	return email, nil
+}
+
 // Тестирование обработчика GenerateTokensHandler.
 // Проверяка генерацию access и refresh токенов для валидного user_id.
 func TestGenerateTokensHandler(t *testing.T) {
@@ -154,30 +168,23 @@ func TestRefreshTokensHandler(t *testing.T) {
 		JWTSecret: "secret",
 	}
 
-	logger := slog.New(
-		slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level:     slog.LevelInfo,
-			AddSource: true,
-		}),
-	)
-
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{}))
 	storage := NewMockStorage()
 
 	userID := "123e4567-e89b-12d3-a456-426614174000"
 	clientIP := "127.0.0.1"
-
 	storage.CreateUser(userID)
 
-	accessToken, err := tokens.GenerateAccessToken(userID, clientIP, cfg.JWTSecret)
+	// Генерация Refresh токена и его хеша.
+	refreshToken, hashedToken, err := tokens.GenerateRefreshTokenAndHash()
 	assert.NoError(t, err)
 
-	refreshToken, err := tokens.GenerateRefreshToken()
+	// Сохранение Refresh токена в хранилище.
+	err = storage.SaveRefreshToken(userID, hashedToken, clientIP)
 	assert.NoError(t, err)
 
-	hashedToken, err := bcrypt.GenerateFromPassword([]byte(refreshToken), bcrypt.DefaultCost)
-	assert.NoError(t, err)
-
-	err = storage.SaveRefreshToken(userID, string(hashedToken), clientIP)
+	// Генерация Access токена.
+	accessToken, err := tokens.GenerateAccessToken(userID, clientIP, cfg.JWTSecret, hashedToken)
 	assert.NoError(t, err)
 
 	reqBody, err := json.Marshal(handlers.TokenResponse{
@@ -225,4 +232,52 @@ func TestRefreshTokensHandler_InvalidAccessToken(t *testing.T) {
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	assert.Contains(t, rec.Body.String(), "invalid access token")
+}
+
+// Тестирование обработчика RefreshTokensHandler.
+// Проверка поведения при изменение IP адреса
+func TestRefreshTokensHandler_IPChangeWarning(t *testing.T) {
+	cfg := &config.Config{
+		JWTSecret: "secret",
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{}))
+	storage := NewMockStorage()
+
+	userID := "123e4567-e89b-12d3-a456-426614174000"
+	clientIP := "127.0.0.1"
+	newClientIP := "192.168.1.1"
+
+	storage.CreateUser(userID)
+
+	refreshToken, hashedToken, err := tokens.GenerateRefreshTokenAndHash()
+	assert.NoError(t, err)
+
+	err = storage.SaveRefreshToken(userID, hashedToken, clientIP)
+	assert.NoError(t, err)
+
+	accessToken, err := tokens.GenerateAccessToken(userID, clientIP, cfg.JWTSecret, hashedToken)
+	assert.NoError(t, err)
+
+	reqBody, err := json.Marshal(handlers.TokenResponse{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+	})
+	assert.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/refresh", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = newClientIP
+
+	rec := httptest.NewRecorder()
+
+	handlers.RefreshTokensHandler(rec, req, logger, cfg, storage)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp handlers.TokenResponse
+	err = json.NewDecoder(rec.Body).Decode(&resp)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, resp.AccessToken)
+	assert.NotEmpty(t, resp.RefreshToken)
 }
